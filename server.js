@@ -33,26 +33,27 @@ try {
   const html = fs.readFileSync(path.join(__dirname, gameFile), 'utf8'), m = html.match(/<script type="application\/json" id="orsim">([\s\S]*?)<\/script>/);
   if (m) {
     const j = JSON.parse(m[1]), bits = Buffer.from(j.grid.b64, 'base64');
-    SIM = { edef: j.edef, groups: j.groups, g: j.grid, bits, mons: [], npcs: [], proj: [], nid: 0 };
+    SIM = { edef: j.edef, groups: j.groups, g: j.grid, bits, mons: [], npcs: [], proj: [], nid: 0, zones: {} };
+    for (const k in (j.zones || {})) { const z = j.zones[k]; SIM.zones[k] = Object.assign({}, z, { bits: Buffer.from(z.b64, 'base64'), x1: z.x0 + z.n * z.res, z1: z.z0 + z.nz * z.res }); }
   }
 } catch (e) { console.log('sim load failed', e.message); }
-console.log(SIM ? 'World simulation on: ' + SIM.groups.length + ' monster groups' : 'No world data in the game file: monsters stay local');
-// the two caves under the small island: the monsters in them are run here too, so everyone in a cave sees (and fights) the same ones
-const ROOMS = {
-  C1: { cx: 31400, rad: 16.1, groups: [['ghoul', -6, 4, 1, 3], ['phantom', 7, 2, 1, 3], ['werebeast', -5, -4, 1, 2], ['mossback', 0, -10.5, 1, 1]] },
-  C2: { cx: 31900, rad: 18.1, groups: [['ghoul', -7, 5, 3, 4], ['phantom', 8, 3, 3, 4], ['werebeast', -6, -4, 3, 3], ['troll', 8, -5, 2, 2], ['demon', 0, -8, 2, 3], ['mossback', 0, -12.5, 1, 1]] }
-};
-const roomAt = x => { if (x < 20000) return null; for (const k in ROOMS) if (Math.abs(x - ROOMS[k].cx) < 30) return k; return null; };
+console.log(SIM ? 'World simulation on: ' + SIM.groups.length + ' monster groups, ' + Object.keys(SIM.zones).length + ' realms and rooms' : 'No world data in the game file: monsters stay local');
+// v0.1.32: every realm and room with monsters is run here too, so everyone in it sees and fights the same ones.
+// Where a monster may stand comes from the game's real shapes (worked out when the game file is built).
+const ZONES = () => (SIM && SIM.zones) || {};
+const zoneAt = x => { const Z = ZONES(); for (const k in Z) if (x >= Z[k].x0 && x < Z[k].x1) return k; return null; };
+const roomAt = zoneAt;
 const rz = p => String(p.zone || '').split('@')[0];   // the game sends 'C1@295,302' (room + the door it came in by)
-const inSim = z => z === '' || !!ROOMS[z];
+const inSim = z => z === '' || !!ZONES()[z];
 const walkW = (x, z) => { const g = SIM.g, i = Math.round((x - g.x0) / g.res), j = Math.round((z - g.x0) / g.res); if (i < 0 || j < 0 || i >= g.n || j >= g.n) return false; const k = j * g.n + i; return (SIM.bits[k >> 3] >> (k & 7)) & 1; };
-const walkable = (x, z) => { if (x > 20000) { const k = roomAt(x); return !!k && Math.hypot(x - ROOMS[k].cx, z) < ROOMS[k].rad; } return walkW(x, z); };
+const walkZ = (Z, x, z) => { const i = Math.round((x - Z.x0) / Z.res), j = Math.round((z - Z.z0) / Z.res); if (i < 0 || j < 0 || i >= Z.n || j >= Z.nz) return false; const k = j * Z.n + i; return (Z.bits[k >> 3] >> (k & 7)) & 1; };
+const walkable = (x, z) => { const k = zoneAt(x); if (k) return !!walkZ(ZONES()[k], x, z); if (Math.abs(x) > 600) return false; return walkW(x, z); };
 const moveEnt = (e, dx, dz) => {
-  const rm = e.x > 20000, nx = rm ? e.x + dx : clamp(e.x + dx, -122, 122), nz = rm ? e.z + dz : clamp(e.z + dz, -122, 122);
+  const rm = !!e.zone, nx = rm ? e.x + dx : clamp(e.x + dx, -122, 122), nz = rm ? e.z + dz : clamp(e.z + dz, -122, 122);
   if (e.ghost || e.fly) { e.x = nx; e.z = nz; return; }
   if (walkable(nx, nz)) { e.x = nx; e.z = nz; } else if (walkable(nx, e.z)) e.x = nx; else if (walkable(e.x, nz)) e.z = nz;
 };
-function spotNear(cx, cz, spread) { for (let i = 0; i < 30; i++) { const a = Math.random() * TAU, d = Math.sqrt(Math.random()) * spread, x = cx + Math.cos(a) * d, z = cz + Math.sin(a) * d; if (walkable(x, z)) return { x, z }; } return { x: cx, z: cz }; }
+function spotNear(cx, cz, spread) { for (let i = 0; i < 30; i++) { const a = Math.random() * TAU, d = Math.sqrt(Math.random()) * spread, x = cx + Math.cos(a) * d, z = cz + Math.sin(a) * d; if (walkable(x, z)) return { x, z }; } for (let r = .5; r <= 8; r += .5) for (let k = 0; k < 16; k++) { const x = cx + Math.cos(k * TAU / 16) * r, z = cz + Math.sin(k * TAU / 16) * r; if (walkable(x, z)) return { x, z }; } return { x: cx, z: cz }; }   // nothing free close by: the nearest free spot
 function nightNow() { const s = Math.sin((clock() - .25) * TAU); return 1 - smooth(-.12, .12, s); }
 function spawnMon(kind, x, z, grp) {
   const d = SIM.edef[kind], e = { nid: 'm' + (++SIM.nid), kind, def: d, x, z, yaw: Math.random() * TAU, hp: d.hp, max: d.hp, r: d.r, dead: false, deadT: 0, home: { x, z }, state: 'idle', wanderT: rnd(0, 3), wander: null, target: null, aggroBoost: 0, atkT: rnd(.2, 1.5), abT: rnd(1, 4), atk: null, moving: false, spdMul: 1, group: grp, fly: !!d.fly, ghost: !!d.ghost, orbit: 0, lunge: null, st: {}, kv: { x: 0, z: 0 } };
@@ -78,9 +79,9 @@ function storyAct(me, d) {
 function initSim() {
   if (!SIM) return;
   for (const g of SIM.groups) { g.members = []; g.timer = -1; g.m.forEach(p => g.members.push(spawnMon(g.kind, p[0], p[1], g))); }
-  for (const k in ROOMS) for (const r of ROOMS[k].groups) {
+  for (const k in SIM.zones) for (const r of (SIM.zones[k].groups || [])) {
     if (!SIM.edef[r[0]]) continue;
-    const g = { kind: r[0], cx: ROOMS[k].cx + r[1], cz: r[2], n: r[3], spread: r[4], members: [], timer: -1, zone: k };
+    const g = { kind: r[0], cx: r[1], cz: r[2], n: r[3], spread: r[4], members: [], timer: -1, zone: k };
     for (let i = 0; i < g.n; i++) { const sp = spotNear(g.cx, g.cz, g.spread), e = spawnMon(g.kind, sp.x, sp.z, g); e.zone = k; g.members.push(e); }
     SIM.groups.push(g);
   }
@@ -246,7 +247,7 @@ function simSnap(p) {
 }
 
 const CHATLOG = [];   // the last few things said in the realm, so people who arrive can see them
-const EMOTES = new Set(['', 'wave', 'bow', 'cheer', 'sit', 'dance', 'waltz', 'courtly', 'folk', 'twirl', 'cry', 'laugh', 'fish']);
+const EMOTES = new Set(['', 'wave', 'bow', 'cheer', 'sit', 'dance', 'waltz', 'courtly', 'folk', 'twirl', 'reel', 'stomp', 'sway', 'devotion', 'skip', 'ribbon', 'cry', 'laugh', 'fish']);
 ns.on('connection', socket => {
   if (players.size >= MAX_PLAYERS) { socket.emit('full'); return socket.disconnect(true); }
   let me = null, n = 0, win = Date.now(), cn = 0, cwin = Date.now();
@@ -287,7 +288,7 @@ ns.on('connection', socket => {
     if (me.zone !== oz) socket.broadcast.emit('pzone', { id: me.id, zone: me.zone });
   });
   socket.on('emote', e => {
-    if (!me || limited()) return; e = clean(e, 12); if (!EMOTES.has(e)) return; me.e = e; socket.broadcast.emit('pemote', { id: me.id, e });
+    if (!me || limited()) return; e = clean(e, 12); if (!EMOTES.has(e) && !/^(sit\d\d|gnd|clm)$/.test(e)) return; me.e = e; socket.broadcast.emit('pemote', { id: me.id, e });
     if (e === 'bow') {   // two people bow to each other: a duet dance
       const now = Date.now(); me.bowAt = now;
       for (const p of players.values()) if (p !== me && p.zone === me.zone && now - (p.bowAt || 0) < 4000 && Math.hypot(p.x - me.x, p.z - me.z) < 3.5) {
